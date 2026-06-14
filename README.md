@@ -6,7 +6,7 @@ This repository is organized as one folder per script or workflow. Each folder s
 
 ## Scripts
 
-- [X README Cards](x-readme-cards/README.md): fetches recent X posts and updates my` GitHub profile README with a three-card post row.
-- [Certbot QoL Deploy Hook](certbot-ntfy-deploy-hook/README.md): restarts my email and web server after TLS certificates are renewed.
+- [X README Cards](x-readme-cards/README.md): (python) fetches recent X posts and updates my` GitHub profile README with a three-card post row.
+- [Certbot QoL Deploy Hook](certbot-ntfy-deploy-hook/README.md): (bash) restarts my email and web server after TLS certificates are renewed.
 
 

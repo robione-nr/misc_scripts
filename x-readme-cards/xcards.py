@@ -2,7 +2,7 @@ import argparse
 import html
 import json
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -14,7 +14,7 @@ START = "<!-- X-POSTS:START -->"
 END = "<!-- X-POSTS:END -->"
 
 TWITTER_DATE = "%a %b %d %H:%M:%S %z %Y"
-MIN_DATE = datetime.min.replace(tzinfo=UTC)
+MIN_DATE = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def load_config() -> dict:
@@ -26,15 +26,17 @@ def load_config() -> dict:
     return json.loads(config_path.read_text())
 
 
-def fetch_posts(config: dict) -> None:
+def fetch_posts(config: dict, limit: int) -> None:
     from Scweet import Scweet
 
     OUTPUTS_DIR.mkdir(exist_ok=True)
+    TWEETS_JSON.unlink(missing_ok=True)
+
     scweet = Scweet(cookies={"auth_token": config["auth_token"], "ct0": config["ct0"]})
 
     scweet.search(
         "from:" + config["username"],
-        limit=config.get("max_posts", 3),
+        limit=limit,
         save=True,
         save_format="json",
         save_name="tweets.json",
@@ -54,6 +56,13 @@ def parse_timestamp(post: dict) -> datetime:
 
 def load_posts(path: Path, limit: int) -> list[dict]:
     posts = json.loads(path.read_text())
+    unique_posts = {}
+
+    for post in posts:
+        key = post.get("tweet_id") or post.get("tweet_url") or clean_text(post)
+        unique_posts[key] = post
+
+    posts = list(unique_posts.values())
     posts.sort(key=parse_timestamp, reverse=True)
     return list(reversed(posts[:limit]))
 
@@ -192,7 +201,7 @@ def main() -> None:
     limit = args.limit or int(config.get("max_posts", 3))
 
     if not args.no_fetch:
-        fetch_posts(config)
+        fetch_posts(config, max(limit * 3, limit))
 
     posts = load_posts(TWEETS_JSON, limit)
     markdown = render_markdown(posts)

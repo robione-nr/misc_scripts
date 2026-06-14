@@ -1,0 +1,9 @@
+# X README cards secrets/runtime files
+x-readme-cards/config.json
+x-readme-cards/.venv/
+x-readme-cards/outputs/
+x-readme-cards/profile-work/
+x-readme-cards/__pycache__/
+x-readme-cards/*.pyc
+x-readme-cards/*.log
+x-readme-cards/scweet_state.db

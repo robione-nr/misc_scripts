@@ -7,3 +7,5 @@ x-readme-cards/__pycache__/
 x-readme-cards/*.pyc
 x-readme-cards/*.log
 x-readme-cards/scweet_state.db
+
+.ignore_scripts

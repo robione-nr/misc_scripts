@@ -1,4 +1,6 @@
 import argparse
+import difflib
+import hashlib
 import html
 import json
 import re
@@ -15,6 +17,7 @@ END = "<!-- X-POSTS:END -->"
 
 TWITTER_DATE = "%a %b %d %H:%M:%S %z %Y"
 MIN_DATE = datetime.min.replace(tzinfo=timezone.utc)
+CARD_RE = re.compile(r"<td\b.*?</td>", re.DOTALL)
 
 
 def load_config() -> dict:
@@ -42,6 +45,15 @@ def fetch_posts(config: dict, limit: int) -> None:
         save_name="tweets.json",
     )
 
+    for candidate in [TWEETS_JSON, ROOT / "tweets.json", Path.cwd() / "tweets.json"]:
+        if candidate.exists():
+            if candidate != TWEETS_JSON:
+                TWEETS_JSON.write_bytes(candidate.read_bytes())
+                candidate.unlink()
+            return
+
+    raise RuntimeError(f"Scweet did not create {TWEETS_JSON}")
+
 
 def parse_timestamp(post: dict) -> datetime:
     timestamp = post.get("timestamp") or post.get("raw", {}).get("legacy", {}).get("created_at")
@@ -54,17 +66,65 @@ def parse_timestamp(post: dict) -> datetime:
         return MIN_DATE
 
 
-def load_posts(path: Path, limit: int) -> list[dict]:
-    posts = json.loads(path.read_text())
+def post_key(post: dict) -> str:
+    return post.get("tweet_id") or post.get("tweet_url") or clean_text(post)
+
+
+def screen_name(post: dict) -> str:
+    return post.get("user", {}).get("screen_name") or ""
+
+
+def is_reply(post: dict) -> bool:
+    legacy = post.get("raw", {}).get("legacy", {})
+    return any(
+        legacy.get(field)
+        for field in [
+            "in_reply_to_status_id_str",
+            "in_reply_to_user_id_str",
+            "in_reply_to_screen_name",
+        ]
+    )
+
+
+def is_retweet(post: dict) -> bool:
+    legacy = post.get("raw", {}).get("legacy", {})
+    return bool(legacy.get("retweeted_status_result") or legacy.get("retweeted_status_id_str"))
+
+
+def is_profile_post(post: dict, username: str) -> bool:
+    return (
+        screen_name(post).lower() == username.lower()
+        and not is_reply(post)
+        and not is_retweet(post)
+    )
+
+
+def load_posts(path: Path, username: str, limit: int) -> tuple[list[dict], dict[str, int]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {path}. Run without --no-fetch to fetch posts first.")
+
+    raw_posts = json.loads(path.read_text())
     unique_posts = {}
 
-    for post in posts:
-        key = post.get("tweet_id") or post.get("tweet_url") or clean_text(post)
+    for post in raw_posts:
+        key = post_key(post)
         unique_posts[key] = post
 
     posts = list(unique_posts.values())
-    posts.sort(key=parse_timestamp, reverse=True)
-    return list(reversed(posts[:limit]))
+    profile_posts = [post for post in posts if is_profile_post(post, username)]
+    profile_posts.sort(key=parse_timestamp, reverse=True)
+
+    selected = profile_posts[:limit]
+    stats = {
+        "loaded": len(posts),
+        "duplicates": len(raw_posts) - len(posts),
+        "skipped_replies": sum(1 for post in posts if is_reply(post)),
+        "skipped_retweets": sum(1 for post in posts if is_retweet(post)),
+        "skipped_other_users": sum(1 for post in posts if screen_name(post).lower() != username.lower()),
+        "eligible": len(profile_posts),
+        "selected": len(selected),
+    }
+    return list(reversed(selected)), stats
 
 
 def media_urls(post: dict) -> list[str]:
@@ -177,7 +237,35 @@ def render_markdown(posts: list[dict]) -> str:
     return f'<table cellspacing="0" cellpadding="0">\n<tr>\n{cards}\n</tr>\n</table>\n'
 
 
-def replace_marked_section(path: Path, content: str) -> None:
+def normalize_markup(content: str) -> str:
+    return "\n".join(line.rstrip() for line in content.strip().splitlines())
+
+
+def content_hash(content: str) -> str:
+    return hashlib.sha256(normalize_markup(content).encode()).hexdigest()
+
+
+def card_hashes(content: str) -> set[str]:
+    return {content_hash(card) for card in CARD_RE.findall(content)}
+
+
+def diff_sections(path: Path, current: str, updated: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            normalize_markup(current).splitlines(keepends=True),
+            normalize_markup(updated).splitlines(keepends=True),
+            fromfile=f"{path}:current",
+            tofile=f"{path}:new",
+        )
+    )
+
+
+def replace_marked_section(
+    path: Path,
+    content: str,
+    dry_run: bool = False,
+    show_diff: bool = False,
+) -> bool:
     existing = path.read_text()
     start = existing.find(START)
     end = existing.find(END)
@@ -185,8 +273,59 @@ def replace_marked_section(path: Path, content: str) -> None:
     if start == -1 or end == -1 or start > end:
         raise ValueError(f"{path} must contain {START} and {END} markers")
 
+    current = existing[start + len(START) : end]
+    if content_hash(current) == content_hash(content):
+        print("README cards unchanged.")
+        return False
+
+    current_hashes = card_hashes(current)
+    updated_hashes = card_hashes(content)
+    action = "would change" if dry_run else "changed"
+    print(
+        f"README cards {action}: "
+        f"{len(updated_hashes - current_hashes)} new, "
+        f"{len(current_hashes - updated_hashes)} removed"
+    )
+
+    if dry_run:
+        if show_diff:
+            print(diff_sections(path, current, content))
+        print("No files changed.")
+        return True
+
     updated = existing[: start + len(START)] + "\n" + content.strip() + "\n" + existing[end:]
     path.write_text(updated)
+    return True
+
+
+def print_selection(posts: list[dict], stats: dict[str, int], verbose: bool = False) -> None:
+    if not verbose:
+        print(f"Prepared {stats['selected']} README cards.")
+        return
+
+    print(
+        "Loaded {loaded} posts; skipped {skipped_replies} replies, "
+        "{skipped_retweets} retweets, {skipped_other_users} posts from other users; "
+        "selected {selected} of {eligible} eligible profile posts.".format(**stats)
+    )
+    for post in posts:
+        parsed = parse_timestamp(post)
+        timestamp = "" if parsed == MIN_DATE else f"{parsed:%Y-%m-%d %H:%M:%S %z}"
+        print(f"Selected {post_key(post)} {timestamp} {post.get('tweet_url', '')}".strip())
+
+
+def snapshot_file(path: Path) -> bytes | None:
+    if not path.exists():
+        return None
+    return path.read_bytes()
+
+
+def restore_file(path: Path, content: bytes | None) -> None:
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
 
 
 def main() -> None:
@@ -195,24 +334,44 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Number of cards to render.")
     parser.add_argument("--output", type=Path, default=CARDS_MARKDOWN, help="Markdown file to write.")
     parser.add_argument("--readme", type=Path, help="Optional Markdown file with X-POSTS markers to update.")
+    parser.add_argument("--dry-run", action="store_true", help="Show changes without writing files.")
+    parser.add_argument("--show-diff", action="store_true", help="Show README card diff during dry runs.")
+    parser.add_argument("--verbose", action="store_true", help="Show selected posts and filtering details.")
     args = parser.parse_args()
 
     config = load_config()
     limit = args.limit or int(config.get("max_posts", 3))
 
-    if not args.no_fetch:
-        fetch_posts(config, max(limit * 3, limit))
+    original_tweets = snapshot_file(TWEETS_JSON) if args.dry_run and not args.no_fetch else None
 
-    posts = load_posts(TWEETS_JSON, limit)
-    markdown = render_markdown(posts)
+    try:
+        if not args.no_fetch:
+            fetch_posts(config, max(limit * 6, limit))
+            print("Fetched recent X posts.")
+        else:
+            print("Using cached X posts.")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(markdown)
+        posts, stats = load_posts(TWEETS_JSON, config["username"], limit)
+        markdown = render_markdown(posts)
+        print_selection(posts, stats, verbose=args.verbose)
 
-    if args.readme:
-        replace_marked_section(args.readme, markdown)
+        if not args.dry_run:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(markdown)
 
-    print(f"Wrote {len(posts)} cards to {args.output}")
+        if args.readme:
+            replace_marked_section(
+                args.readme,
+                markdown,
+                dry_run=args.dry_run,
+                show_diff=args.show_diff,
+            )
+
+        if not args.dry_run:
+            print(f"Generated {len(posts)} README cards.")
+    finally:
+        if args.dry_run and not args.no_fetch:
+            restore_file(TWEETS_JSON, original_tweets)
 
 
 if __name__ == "__main__":

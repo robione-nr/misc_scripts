@@ -11,12 +11,53 @@ UPDATE_BRANCH="${UPDATE_BRANCH:-update-x-posts}"
 README_PATH="${README_PATH:-README.md}"
 COMMIT_MESSAGE="${COMMIT_MESSAGE:-docs(readme): update X posts}"
 AUTO_MERGE_MAIN="${AUTO_MERGE_MAIN:-true}"
+DRY_RUN="${DRY_RUN:-false}"
+NO_FETCH="${NO_FETCH:-false}"
+SHOW_DIFF="${SHOW_DIFF:-false}"
+VERBOSE="${VERBOSE:-false}"
 
 START_MARKER="<!-- X-POSTS:START -->"
 END_MARKER="<!-- X-POSTS:END -->"
 
 log() {
   printf '%s\n' "$*"
+}
+
+log_run_header() {
+  printf '===== %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+}
+
+usage() {
+  printf 'Usage: %s [--dry-run] [--no-fetch] [--show-diff] [--verbose]\n' "$(basename "$0")"
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run)
+        DRY_RUN=true
+        ;;
+      --no-fetch)
+        NO_FETCH=true
+        ;;
+      --show-diff)
+        SHOW_DIFF=true
+        ;;
+      --verbose)
+        VERBOSE=true
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage
+        log "Unknown option: $1"
+        exit 1
+        ;;
+    esac
+    shift
+  done
 }
 
 install_apt_package() {
@@ -83,9 +124,17 @@ ensure_venv() {
 }
 
 ensure_python_dependencies() {
-  "$PYTHON" -m pip install --upgrade pip
+  if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
+    log "Virtualenv at $VENV_DIR cannot run pip."
+    exit 1
+  fi
 
   if ! "$PYTHON" -c "import Scweet" >/dev/null 2>&1; then
+    if [ "$DRY_RUN" = "true" ]; then
+      log "Dry run: Scweet is not installed in $VENV_DIR. No dependencies were installed."
+      exit 1
+    fi
+
     log "Installing Python dependencies from requirements.txt"
     "$PIP" install -r "$SCRIPT_DIR/requirements.txt"
   else
@@ -116,12 +165,22 @@ ensure_readme_markers() {
   readme="$REPO_DIR/$README_PATH"
 
   if [ ! -f "$readme" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+      log "Dry run: would create $README_PATH with X post markers"
+      return 1
+    fi
+
     log "Creating $README_PATH with X post markers"
     printf '# robione-nr\n\n%s\n%s\n' "$START_MARKER" "$END_MARKER" > "$readme"
     return
   fi
 
   if ! grep -Fq "$START_MARKER" "$readme" || ! grep -Fq "$END_MARKER" "$readme"; then
+    if [ "$DRY_RUN" = "true" ]; then
+      log "Dry run: would add X post markers to $README_PATH"
+      return 1
+    fi
+
     log "Adding X post markers to $README_PATH"
     printf '\n%s\n%s\n' "$START_MARKER" "$END_MARKER" >> "$readme"
   fi
@@ -163,7 +222,32 @@ publish_update() {
   fi
 }
 
+run_xcards() {
+  args=("$SCRIPT_DIR/xcards.py" "--readme" "$REPO_DIR/$README_PATH")
+
+  if [ "$DRY_RUN" = "true" ]; then
+    args+=("--dry-run")
+  fi
+
+  if [ "$NO_FETCH" = "true" ]; then
+    args+=("--no-fetch")
+  fi
+
+  if [ "$SHOW_DIFF" = "true" ]; then
+    args+=("--show-diff")
+  fi
+
+  if [ "$VERBOSE" = "true" ]; then
+    args+=("--verbose")
+  fi
+
+  "$PYTHON" "${args[@]}"
+}
+
 cd "$SCRIPT_DIR"
+
+log_run_header
+parse_args "$@"
 
 ensure_command git git
 ensure_command python3 python3
@@ -174,11 +258,22 @@ ensure_local_file "$SCRIPT_DIR/requirements.txt"
 ensure_venv
 ensure_python_dependencies
 ensure_repo
-ensure_readme_markers
-prepare_update_branch
+if ! ensure_readme_markers; then
+  exit 0
+fi
+
+if [ "$DRY_RUN" != "true" ]; then
+  prepare_update_branch
+fi
 
 cd "$SCRIPT_DIR"
-"$PYTHON" "$SCRIPT_DIR/xcards.py" --readme "$REPO_DIR/$README_PATH"
+if [ "$DRY_RUN" = "true" ]; then
+  run_xcards
+  log "Dry run complete. No commit or push."
+  exit 0
+fi
+
+run_xcards
 
 commit_readme_update
 publish_update
